@@ -16,7 +16,7 @@ st.caption("Enter any tag/phrase. We’ll normalize, correct typos, and match to
 # 1) DATA SOURCE
 USE_LOCAL_FOLDER = True   # set False to fetch a ZIP from GitHub
 LOCAL_DIR = "./diabetes_subset_rf2"  # commit the 3 TSVs here if using local
-ZIP_URL  = "https://github.com/waqasahmed138/diabetes-matcher-ui/raw/main/diabetes_subset_rf2.zip"  # RAW link if using ZIP
+ZIP_URL  = "https://github.com/waqasahmed138/diabetes-matcher-ui/raw/refs/heads/main/diabetes_subset_rf2.zip"  # RAW link if using ZIP
 ZIP_PATH = "/tmp/diabetes_subset_rf2.zip"
 EXTRACT_DIR = "./diabetes_subset_rf2"  # same as LOCAL_DIR intentionally
 
