@@ -1,0 +1,7 @@
+streamlit
+transformers
+torch
+scikit-learn
+pandas
+rapidfuzz
+requests
