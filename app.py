@@ -100,7 +100,7 @@ zs_label = zs["labels"][0]
 zs_score = zs["scores"][0]
 
 if zs_label == "diabetes" and zs_score >= 0.70:
-    return True, "zero-shot", zs_score
+return True, "zero-shot", zs_score
 
 # Centroid similarity
 emb = embed_sapbert([t])
