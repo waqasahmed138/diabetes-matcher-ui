@@ -15,7 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 
 # ============================================================
-# CONFIG
+# PAGE CONFIG
 # ============================================================
 st.set_page_config(page_title="Diabetes Concept Matcher", page_icon="🩸")
 
@@ -24,12 +24,14 @@ NEW_TERMS_LOG = "new_terms_log.csv"
 
 
 # ============================================================
-# LOAD MODELS (Cached for speed)
+# LOAD MODELS (CACHED)
 # ============================================================
 @st.cache_resource
 def load_models():
+    # Zero-shot
     zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
+    # SapBERT
     sap_name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
     sap_tokenizer = AutoTokenizer.from_pretrained(sap_name)
     sap_model = AutoModel.from_pretrained(sap_name)
@@ -37,11 +39,22 @@ def load_models():
 
     return zero_shot, sap_tokenizer, sap_model
 
-    zero_shot, sap_tokenizer, sap_model = load_models()
+
+zero_shot, sap_tokenizer, sap_model = load_models()
 
 
 # ============================================================
-# LOAD RF2 SUBSET FILES
+# EMBEDDING HELPERS
+# ============================================================
+def embed_sapbert(texts):
+    inputs = sap_tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
+    with torch.no_grad():
+        out = sap_model(**inputs)
+    return out.last_hidden_state[:, 0, :].cpu().numpy()
+
+
+# ============================================================
+# LOAD RF2 SUBSET
 # ============================================================
 @st.cache_data
 def load_rf2(base_dir):
@@ -56,33 +69,34 @@ def load_rf2(base_dir):
 
     return desc, con, rel, terms, ids
 
+
 descriptions, concepts, relationships, all_terms, concept_ids = load_rf2(BASE_DIR)
 
 
 # ============================================================
-# EMBEDDING UTILITIES
+# PRECOMPUTE TERM EMBEDDINGS
 # ============================================================
-def embed_sapbert(texts):
-    inputs = sap_tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
-    with torch.no_grad():
-        out = sap_model(**inputs)
-    return out.last_hidden_state[:,0,:].cpu().numpy()
-
-
 @st.cache_resource
 def get_term_embeddings():
     return embed_sapbert(all_terms)
+
 
 term_embeddings = get_term_embeddings()
 
 
 # ============================================================
-# DIABETES CENTROID
+# DIABETES CENTROID VECTOR
 # ============================================================
 diabetes_anchors = [
-    "diabetes", "diabetes mellitus", "type 2 diabetes",
-    "hyperglycemia", "insulin resistance", "glucose intolerance",
-    "high blood sugar", "low insulin", "increased glucose"
+    "diabetes",
+    "diabetes mellitus",
+    "type 2 diabetes",
+    "hyperglycemia",
+    "insulin resistance",
+    "glucose intolerance",
+    "high blood sugar",
+    "low insulin",
+    "increased glucose",
 ]
 
 anchor_embs = embed_sapbert(diabetes_anchors)
@@ -90,31 +104,12 @@ diabetes_centroid = anchor_embs.mean(axis=0, keepdims=True)
 
 
 # ============================================================
-# HYBRID DIABETES RELEVANCE DETECTOR
+# HYBRID DIABETES DETECTOR
 # ============================================================
-
-
-# Zero-shot
-zs = zero_shot(t, ["diabetes", "not_related"])
-zs_label = zs["labels"][0]
-zs_score = zs["scores"][0]
-
-if zs_label == "diabetes" and zs_score >= 0.70:
-return True, "zero-shot", zs_score
-
-# Centroid similarity
-emb = embed_sapbert([t])
-sim = cosine_similarity(emb, diabetes_centroid)[0][0]
-
-if sim >= 0.70:
-    return True, "centroid", float(sim)
-
-return False, "none", float(max(zs_score, sim))
-
 def is_diabetes_related(text):
     t = text.lower().strip()
 
-    # 1️⃣ Zero-shot classification
+    # Zero-shot classification
     zs = zero_shot(t, ["diabetes", "not_related"])
     zs_label = zs["labels"][0]
     zs_score = zs["scores"][0]
@@ -122,18 +117,18 @@ def is_diabetes_related(text):
     if zs_label == "diabetes" and zs_score >= 0.70:
         return True, "zero-shot", zs_score
 
-    # 2️⃣ Diabetes centroid similarity
+    # Centroid similarity
     emb = embed_sapbert([t])
     sim = cosine_similarity(emb, diabetes_centroid)[0][0]
 
     if sim >= 0.70:
         return True, "centroid", float(sim)
 
-    # Not diabetes-related
     return False, "none", float(max(zs_score, sim))
 
+
 # ============================================================
-# SNOMED CT MATCHING
+# FULL MATCHING PIPELINE
 # ============================================================
 def analyze_user_phrase(text):
     text_clean = text.lower().strip()
@@ -175,40 +170,13 @@ def analyze_user_phrase(text):
         "decision": decision,
         "concept": match_term if matched else None,
         "conceptId": match_id if matched else None,
-        "similarity": sim_score
+        "similarity": sim_score,
     }
 
-    # STEP 2 — SNOMED matching
-    user_emb = embed_sapbert([text_clean])
-    sims = cosine_similarity(user_emb, term_embeddings)[0]
-    idx = int(np.argmax(sims))
 
-    match_term = all_terms[idx]
-    match_id = concept_ids[idx]
-    sim_score = float(sims[idx])
-
-    # STEP 3 — Decision
-    if sim_score >= 0.85:
-        decision = "High match — existing SNOMED concept recognized"
-        matched = True
-    elif 0.60 <= sim_score < 0.85:
-        decision = "Medium match — possible child concept"
-        matched = True
-    else:
-        decision = "Low match — diabetes-related but NO suitable SNOMED concept found"
-        matched = False
-
-    return {
-        "diabetes_related": True,
-        "method": method,
-        "relevance_score": rel_score,
-        "matched": matched,
-        "decision": decision,
-        "concept": match_term if matched else None,
-        "conceptId": match_id if matched else None,
-        "similarity": sim_score
-    }
-
+# ============================================================
+# LOGGING
+# ============================================================
 def init_new_terms_log():
     if not os.path.exists(NEW_TERMS_LOG):
         with open(NEW_TERMS_LOG, "w", newline="") as f:
@@ -217,6 +185,7 @@ def init_new_terms_log():
                 "timestamp", "raw_phrase", "matched_term", "concept_id",
                 "similarity", "action", "reviewer", "review_time"
             ])
+
 
 def log_new_term(raw, term, cid, sim, action):
     init_new_terms_log()
@@ -230,14 +199,14 @@ def log_new_term(raw, term, cid, sim, action):
 
 
 # ============================================================
-# ADD TERM TO TSV
+# APPEND NEW SYNONYM TO SUBSET
 # ============================================================
 def append_new_phrase_to_subset(raw_phrase, matched_term, matched_id):
     file_path = f"{BASE_DIR}/descriptions_diabetes.tsv"
     df = pd.read_csv(file_path, sep="\t", dtype=str)
 
     if raw_phrase.lower() in df["term"].astype(str).str.lower().values:
-        st.info("Phrase already exists.")
+        st.info("Term already exists.")
         return False
 
     new_row = {
@@ -258,11 +227,11 @@ def append_new_phrase_to_subset(raw_phrase, matched_term, matched_id):
 
 
 # ============================================================
-# USER INTERFACE
+# UI
 # ============================================================
 st.title("🩸 Hybrid Diabetes Concept Matcher (AI + SNOMED CT)")
 
-user_input = st.text_input("Enter your phrase (e.g., 'my sugar is high today')")
+user_input = st.text_input("Enter a tag or phrase (e.g., 'my sugar is high today')")
 
 if user_input:
     res = analyze_user_phrase(user_input)
@@ -341,10 +310,10 @@ if st.button("Create ZIP"):
 
 
 # ============================================================
-# PUSH BACK TO GITHUB
+# PUSH TO GITHUB
 # ============================================================
 with st.expander("🚀 Push Updated TSV to GitHub"):
-    repo = st.text_input("Repository (e.g. username/repo)")
+    repo = st.text_input("Repository (e.g., username/repo)")
     token = st.text_input("GitHub Token", type="password")
     file_to_push = f"{BASE_DIR}/descriptions_diabetes.tsv"
 
@@ -371,25 +340,3 @@ with st.expander("🚀 Push Updated TSV to GitHub"):
                 st.success("Pushed to GitHub!")
             else:
                 st.error(f"Error: {r.text}")
-
-def is_diabetes_related(text):
-    t = text.lower().strip()
-
-    # 1️⃣ Zero-shot classification
-    zs = zero_shot(t, ["diabetes", "not_related"])
-    zs_label = zs["labels"][0]
-    zs_score = zs["scores"][0]
-
-    if zs_label == "diabetes" and zs_score >= 0.70:
-        return True, "zero-shot", zs_score
-
-    # 2️⃣ Diabetes centroid similarity (SapBERT)
-    emb = embed_sapbert([t])
-    sim = cosine_similarity(emb, diabetes_centroid)[0][0]
-
-    if sim >= 0.70:
-        return True, "centroid", float(sim)
-
-    # ❌ Only return false if BOTH AI models disagree
-    return False, "none", float(max(zs_score, sim))
-
