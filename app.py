@@ -158,9 +158,6 @@ def analyze_user_phrase(text):
         "similarity": sim_score
     }
 
- ============================================================
-# LOGGING NEW TERMS
-# ============================================================
 def init_new_terms_log():
     if not os.path.exists(NEW_TERMS_LOG):
         with open(NEW_TERMS_LOG, "w", newline="") as f:
