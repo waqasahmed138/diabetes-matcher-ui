@@ -92,8 +92,7 @@ diabetes_centroid = anchor_embs.mean(axis=0, keepdims=True)
 # ============================================================
 # HYBRID DIABETES RELEVANCE DETECTOR
 # ============================================================
-def is_diabetes_related(text):
-    t = text.lower().strip()
+
 
     # Zero-shot
     zs = zero_shot(t, ["diabetes", "not_related"])
@@ -120,12 +119,15 @@ def analyze_user_phrase(text):
 
     related, method, rel_score = is_diabetes_related(text)
 
+     related, method, rel_score = is_diabetes_related(text_clean)
     if not related:
-        return {
-            "diabetes_related": False,
-            "reason": f"Not diabetes-related (score={rel_score:.3f}, method={method})"
-        }
+    st.error(f"❌ Not diabetes-related (score={rel_score:.3f}, method={method})")
+    return
 
+
+
+
+    
     # SNOMED Matching
     user_emb = embed_sapbert([text])
     sims = cosine_similarity(user_emb, term_embeddings)[0]
@@ -323,3 +325,25 @@ with st.expander("🚀 Push Updated TSV to GitHub"):
                 st.success("Pushed to GitHub!")
             else:
                 st.error(f"Error: {r.text}")
+
+def is_diabetes_related(text):
+    t = text.lower().strip()
+
+    # 1️⃣ Zero-shot classification
+    zs = zero_shot(t, ["diabetes", "not_related"])
+    zs_label = zs["labels"][0]
+    zs_score = zs["scores"][0]
+
+    if zs_label == "diabetes" and zs_score >= 0.70:
+        return True, "zero-shot", zs_score
+
+    # 2️⃣ Diabetes centroid similarity (SapBERT)
+    emb = embed_sapbert([t])
+    sim = cosine_similarity(emb, diabetes_centroid)[0][0]
+
+    if sim >= 0.70:
+        return True, "centroid", float(sim)
+
+    # ❌ Only return false if BOTH AI models disagree
+    return False, "none", float(max(zs_score, sim))
+
