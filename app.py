@@ -1,223 +1,325 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import torch, os, zipfile, requests, re, unicodedata, csv
+import os
+import zipfile
+import csv
+import base64
+import requests
+import json
 from datetime import datetime
+
+from transformers import AutoTokenizer, AutoModel, pipeline
+import torch
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import AutoTokenizer, AutoModel
-from rapidfuzz import process, fuzz
 
-# =============== UI CONFIG ===============
-st.set_page_config(page_title="Folksonomized Ontology - SHCS")
-st.title("Semantic Mapping (SNOMED CT subset + SapBERT)")
-st.caption("Enter any tag/phrase. We’ll normalize, correct typos, and match to the closest diabetes concept.")
 
-# =============== SETTINGS ===============
-# 1) DATA SOURCE
-USE_LOCAL_FOLDER = True
-LOCAL_DIR = "./diabetes_subset_rf2"
-ZIP_PATH = "/tmp/diabetes_subset_rf2.zip"
-EXTRACT_DIR = "./diabetes_subset_rf2"  # same as LOCAL_DIR intentionally
+# ============================================================
+# CONFIG
+# ============================================================
+st.set_page_config(page_title="Diabetes Concept Matcher", page_icon="🩸")
 
-# 2) THRESHOLDS (you can expose some in the sidebar)
-with st.sidebar:
-    st.header("⚙️ Settings")
-    threshold = st.slider("Not-related threshold (cosine)", 0.0, 1.0, 0.60, 0.01)
-    high_thresh = st.slider("High match threshold", 0.0, 1.0, 0.85, 0.01)
-    fuzzy_score = st.slider("RapidFuzz token similarity cutoff (0-100)", 0, 100, 75, 1)
-    show_topk = st.slider("Show Top-K similar concepts", 1, 10, 5, 1)
-    st.markdown("---")
-    st.caption("Tip: If your TSVs aren’t in the repo, set USE_LOCAL_FOLDER=False and make sure ZIP_URL points to a RAW zip file.")
+BASE_DIR = "./diabetes_subset_rf2"
+NEW_TERMS_LOG = "new_terms_log.csv"
 
-# =============== DATA LOADING ===============
-@st.cache_data(show_spinner=False)
-def ensure_data(local_ok=True):
-    if local_ok and os.path.isdir(LOCAL_DIR):
-        return LOCAL_DIR
-    # fallback: download & extract ZIP
-    os.makedirs(EXTRACT_DIR, exist_ok=True)
-    r = requests.get(ZIP_URL, timeout=60)
-    with open(ZIP_PATH, "wb") as f:
-        f.write(r.content)
-    with zipfile.ZipFile(ZIP_PATH, "r") as zf:
-        zf.extractall(EXTRACT_DIR)
-    return EXTRACT_DIR
 
-@st.cache_data(show_spinner=False)
+# ============================================================
+# LOAD MODELS (Cached for speed)
+# ============================================================
+@st.cache_resource
+def load_models():
+    zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+
+    sap_name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
+    sap_tokenizer = AutoTokenizer.from_pretrained(sap_name)
+    sap_model = AutoModel.from_pretrained(sap_name)
+    sap_model.eval()
+
+    return zero_shot, sap_tokenizer, sap_model
+
+zero_shot, sap_tokenizer, sap_model = load_models()
+
+
+# ============================================================
+# LOAD RF2 SUBSET FILES
+# ============================================================
+@st.cache_data
 def load_rf2(base_dir):
-    desc = pd.read_csv(os.path.join(base_dir, "descriptions_diabetes.tsv"), sep="\t", dtype=str)
-    con  = pd.read_csv(os.path.join(base_dir, "concepts_diabetes.tsv"), sep="\t", dtype=str)
-    rel  = pd.read_csv(os.path.join(base_dir, "relationships_diabetes.tsv"), sep="\t", dtype=str)
-    desc = desc[desc["active"] == "1"].copy()
-    return desc, con, rel
+    desc = pd.read_csv(f"{base_dir}/descriptions_diabetes.tsv", sep="\t", dtype=str)
+    con = pd.read_csv(f"{base_dir}/concepts_diabetes.tsv", sep="\t", dtype=str)
+    rel = pd.read_csv(f"{base_dir}/relationships_diabetes.tsv", sep="\t", dtype=str)
 
-base_dir = ensure_data(USE_LOCAL_FOLDER)
-descriptions, concepts, relationships = load_rf2(base_dir)
+    desc = desc[desc["active"] == "1"]
 
-# =============== MODEL LOADING ===============
-@st.cache_resource(show_spinner=True)
-def load_model():
-    name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
-    tok = AutoTokenizer.from_pretrained(name)
-    mdl = AutoModel.from_pretrained(name)
-    mdl.eval()
-    return tok, mdl
+    terms = desc["term"].dropna().astype(str).unique().tolist()
+    ids = desc["conceptId"].astype(str).tolist()
 
-tokenizer, model = load_model()
-st.success("SapBERT loaded and RF2 subset ready.", icon="✅")
+    return desc, con, rel, terms, ids
 
-# =============== BUILD LEXICON & EMBEDDINGS ===============
-def normalize_unicode_lower(text): return unicodedata.normalize("NFKC", text).lower()
+descriptions, concepts, relationships, all_terms, concept_ids = load_rf2(BASE_DIR)
 
-def strip_noise(text):
-    text = re.sub(r'(https?://\S+)|(\w+@\w+\.\w+)', ' ', text)
-    text = text.encode('ascii', 'ignore').decode()
-    text = re.sub(r'[^a-z0-9\s/+-]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
 
-STOPWORDS = {
-  "a","an","the","and","or","but","if","then","else","so","to","of","in","on","for","with",
-  "is","are","am","be","was","were","been","being","it","this","that","these","those",
-  "i","you","he","she","we","they","me","him","her","us","them","my","your","our",
-  "at","by","as","from","about","how","what","why","when","where","which","who","whom"
-}
-ACRONYM_MAP = {
-  "dm":"diabetes mellitus","t1dm":"type 1 diabetes mellitus","t2dm":"type 2 diabetes mellitus",
-  "fsbs":"fingerstick blood sugar"
-}
-def expand_acronyms(t): return " ".join(ACRONYM_MAP.get(w, w) for w in t.split())
-def normalize_numbers_units(t):
-    t = re.sub(r'\bmg\s*/\s*dl\b', 'mg/dl', t)
-    t = re.sub(r'\bmmol\s*/\s*l\b', 'mmol/l', t)
-    return t
-
-@st.cache_data(show_spinner=False)
-def build_lexicon(desc_df):
-    lex = set()
-    for term in desc_df["term"].dropna().astype(str):
-        t = strip_noise(normalize_unicode_lower(term))
-        for tok in t.split():
-            if len(tok) >= 3:
-                lex.add(tok)
-    lex.update({"dm","t1dm","t2dm","hba1c","glucose","insulin","hypoglycemia","hyperglycemia"})
-    return lex
-
-diabetes_lexicon = build_lexicon(descriptions)
-
-def correct_spelling(tok, vocab, cutoff=75):
-    if tok in vocab: 
-        return tok
-    match = process.extractOne(tok, vocab, scorer=fuzz.QRatio, score_cutoff=cutoff)
-    return match[0] if match else tok
-
-def fuzzy_in_vocab(tok, vocab, cutoff=75):
-    if tok in vocab: return True
-    return process.extractOne(tok, vocab, scorer=fuzz.QRatio, score_cutoff=cutoff) is not None
-
-def clean_and_filter(text, vocab, cutoff=75, autocorrect=True):
-    t = normalize_unicode_lower(text)
-    t = strip_noise(t)
-    t = expand_acronyms(t)
-    t = normalize_numbers_units(t)
-    toks = [w for w in t.split() if w not in STOPWORDS]
-    kept = []
-    for tok in toks:
-        if len(tok) < 1: 
-            continue
-        if autocorrect:
-            tok = correct_spelling(tok, vocab, cutoff=cutoff)
-        if fuzzy_in_vocab(tok, vocab, cutoff=cutoff):
-            kept.append(tok)
-    return " ".join(kept)
-
-@st.cache_resource(show_spinner=True)
-def embed_terms(terms):
-    vecs = []
-    bs = 16
-    for i in range(0, len(terms), bs):
-        batch = terms[i:i+bs]
-        inputs = tokenizer(batch, padding=True, truncation=True, return_tensors='pt')
-        with torch.no_grad():
-            outputs = model(**inputs)
-        cls = outputs.last_hidden_state[:,0,:]
-        vecs.append(cls)
-    return torch.cat(vecs).cpu().numpy()
-
-all_terms = descriptions["term"].dropna().astype(str).unique().tolist()
-concept_ids = descriptions.loc[descriptions["term"].notna(), "conceptId"].astype(str).tolist()
-term_embeddings = embed_terms(all_terms)
-
-# =============== MATCHING HELPERS ===============
-def get_topk(input_text, k=5):
-    inputs = tokenizer([input_text], padding=True, truncation=True, return_tensors='pt')
+# ============================================================
+# EMBEDDING UTILITIES
+# ============================================================
+def embed_sapbert(texts):
+    inputs = sap_tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
     with torch.no_grad():
-        outputs = model(**inputs)
-    u = outputs.last_hidden_state[:,0,:].cpu().numpy()
-    sims = cosine_similarity(u, term_embeddings)[0]
-    idxs = np.argsort(-sims)[:k]
-    rows = []
-    for i in idxs:
-        rows.append({
-            "rank": len(rows)+1,
-            "term": all_terms[i],
-            "conceptId": concept_ids[i],
-            "similarity": float(sims[i])
-        })
-    return rows
+        out = sap_model(**inputs)
+    return out.last_hidden_state[:,0,:].cpu().numpy()
 
-LOG_FILE = "user_tag_log.csv"
-def log_entry(raw, normalized, best, best_id, score, decision):
-    header = ["timestamp","raw_input","normalized","matched_term","concept_id","similarity_score","decision"]
-    exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if not exists: w.writerow(header)
-        w.writerow([datetime.now().isoformat(timespec='seconds'), raw, normalized, best, best_id,
-                    f"{score:.3f}" if score is not None else "", decision])
 
-# =============== ONE-FORM UI ===============
-tag = st.text_input("💬 Enter a tag or phrase (e.g., 'type 2 sugar level high')", "")
-go = st.button("Match concept")
+@st.cache_resource
+def get_term_embeddings():
+    return embed_sapbert(all_terms)
 
-if go and tag.strip():
-    # 1) clean + gate
-    normalized = clean_and_filter(tag, diabetes_lexicon, cutoff=fuzzy_score, autocorrect=True)
-    if not normalized:
-        st.error("❌ Not diabetes-related (no domain tokens after cleaning).")
-        log_entry(tag, "", "", "", 0.0, "Not related")
+term_embeddings = get_term_embeddings()
+
+
+# ============================================================
+# DIABETES CENTROID
+# ============================================================
+diabetes_anchors = [
+    "diabetes", "diabetes mellitus", "type 2 diabetes",
+    "hyperglycemia", "insulin resistance", "glucose intolerance",
+    "high blood sugar", "low insulin", "increased glucose"
+]
+
+anchor_embs = embed_sapbert(diabetes_anchors)
+diabetes_centroid = anchor_embs.mean(axis=0, keepdims=True)
+
+
+# ============================================================
+# HYBRID DIABETES RELEVANCE DETECTOR
+# ============================================================
+def is_diabetes_related(text):
+    t = text.lower().strip()
+
+    # Zero-shot
+    zs = zero_shot(t, ["diabetes", "not_related"])
+    zs_label = zs["labels"][0]
+    zs_score = zs["scores"][0]
+
+    if zs_label == "diabetes" and zs_score >= 0.70:
+        return True, "zero-shot", zs_score
+
+    # Centroid similarity
+    emb = embed_sapbert([t])
+    sim = cosine_similarity(emb, diabetes_centroid)[0][0]
+
+    if sim >= 0.70:
+        return True, "centroid", float(sim)
+
+    return False, "none", float(max(zs_score, sim))
+
+
+# ============================================================
+# SNOMED CT MATCHING
+# ============================================================
+def analyze_user_phrase(text):
+
+    related, method, rel_score = is_diabetes_related(text)
+
+    if not related:
+        return {
+            "diabetes_related": False,
+            "reason": f"Not diabetes-related (score={rel_score:.3f}, method={method})"
+        }
+
+    # SNOMED Matching
+    user_emb = embed_sapbert([text])
+    sims = cosine_similarity(user_emb, term_embeddings)[0]
+    idx = int(np.argmax(sims))
+
+    match_term = all_terms[idx]
+    match_id = concept_ids[idx]
+    sim_score = float(sims[idx])
+
+    # Decision
+    if sim_score >= 0.85:
+        decision = "High match — existing SNOMED concept recognized"
+        matched = True
+    elif 0.60 <= sim_score < 0.85:
+        decision = "Medium match — possible child concept"
+        matched = True
     else:
-        # 2) similarity
-        topk = get_topk(normalized, k=show_topk)
-        best = topk[0]
-        st.subheader("🔍 Result")
-        st.write(f"**User Tag:** {tag}")
-        st.write(f"**Normalized:** `{normalized}`")
-        st.write(f"**Closest Match:** {best['term']}  \n**Concept ID:** `{best['conceptId']}`  \n**Cosine Similarity:** `{best['similarity']:.3f}`")
+        decision = "Low match — diabetes-related but no suitable SNOMED concept found"
+        matched = False
 
-        # 3) decision
-        if best["similarity"] < threshold:
-            decision = "Not related (below threshold)"
-            st.error("🔴 Below threshold — treat as NOT related to Diabetes SNOMED CT subset.")
-        elif best["similarity"] >= high_thresh:
-            decision = "Existing concept recognized"
-            st.success("✅ High similarity — existing concept recognized.")
+    return {
+        "diabetes_related": True,
+        "method": method,
+        "relevance_score": rel_score,
+        "matched": matched,
+        "decision": decision,
+        "concept": match_term if matched else None,
+        "conceptId": match_id if matched else None,
+        "similarity": sim_score
+    }
+
+
+# ============================================================
+# LOGGING NEW TERMS
+# ============================================================
+def init_new_terms_log():
+    if not os.path.exists(NEW_TERMS_LOG):
+        with open(NEW_TERMS_LOG, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "timestamp", "raw_phrase", "matched_term", "concept_id",
+                "similarity", "action", "reviewer", "review_time"
+            ])
+
+def log_new_term(raw, term, cid, sim, action):
+    init_new_terms_log()
+    with open(NEW_TERMS_LOG, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().isoformat(timespec='seconds'),
+            raw, term, cid, f"{sim:.3f}",
+            action, "", ""
+        ])
+
+
+# ============================================================
+# ADD TERM TO TSV
+# ============================================================
+def append_new_phrase_to_subset(raw_phrase, matched_term, matched_id):
+    file_path = f"{BASE_DIR}/descriptions_diabetes.tsv"
+    df = pd.read_csv(file_path, sep="\t", dtype=str)
+
+    if raw_phrase.lower() in df["term"].astype(str).str.lower().values:
+        st.info("Phrase already exists.")
+        return False
+
+    new_row = {
+        "id": f"user_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        "effectiveTime": datetime.now().strftime("%Y%m%d"),
+        "active": "1",
+        "moduleId": "999999999999999999",
+        "conceptId": matched_id,
+        "languageCode": "en",
+        "typeId": "900000000000003001",
+        "term": raw_phrase,
+        "caseSignificanceId": "900000000000020002"
+    }
+
+    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+    df.to_csv(file_path, sep="\t", index=False)
+    return True
+
+
+# ============================================================
+# USER INTERFACE
+# ============================================================
+st.title("🩸 Hybrid Diabetes Concept Matcher (AI + SNOMED CT)")
+
+user_input = st.text_input("Enter your phrase (e.g., 'my sugar is high today')")
+
+if user_input:
+    res = analyze_user_phrase(user_input)
+
+    if not res["diabetes_related"]:
+        st.error(res["reason"])
+    else:
+        st.success(f"Diabetes-related (method={res['method']}, score={res['relevance_score']:.3f})")
+
+        st.write("### SNOMED Match Result:")
+        st.write(f"Decision: **{res['decision']}**")
+
+        if res["matched"]:
+            st.write(f"Concept: **{res['concept']}**")
+            st.write(f"Concept ID: `{res['conceptId']}`")
+            st.write(f"Similarity: `{res['similarity']:.3f}`")
+
+            if st.checkbox("Add this phrase as a new synonym?"):
+                if append_new_phrase_to_subset(user_input, res["concept"], res["conceptId"]):
+                    st.success("Added to subset!")
+                    log_new_term(user_input, res["concept"], res["conceptId"], res["similarity"], "added")
         else:
-            decision = "Child concept candidate"
-            st.warning("🟡 Medium similarity — potential child concept candidate.")
+            st.warning("No suitable SNOMED concept found.")
+            if st.checkbox("Queue this phrase for review?"):
+                log_new_term(user_input, "-", "-", res["relevance_score"], "queued")
+                st.success("Queued for review.")
 
-        # 4) show top-K table
-        st.markdown("**Top matches**")
-        df = pd.DataFrame(topk)
-        st.dataframe(df, hide_index=True)
 
-        # 5) log
-        log_entry(tag, normalized, best["term"], best["conceptId"], best["similarity"], decision)
+# ============================================================
+# ADMIN REVIEW
+# ============================================================
+with st.expander("🔐 Admin Review"):
+    if os.path.exists(NEW_TERMS_LOG):
+        df = pd.read_csv(NEW_TERMS_LOG)
+        pending = df[df["action"] == "queued"]
 
-# =============== UTILITIES ===============
-with st.expander("📥 Download logs"):
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "rb") as f:
-            st.download_button("Download user_tag_log.csv", f, file_name="user_tag_log.csv")
-    else:
-        st.caption("No logs yet.")
+        if pending.empty:
+            st.info("No queued items.")
+        else:
+            for i, row in pending.iterrows():
+                st.write(f"**Phrase:** {row['raw_phrase']} | Score={row['similarity']}")
+
+                c1, c2 = st.columns(2)
+                if c1.button(f"Approve {i}"):
+                    append_new_phrase_to_subset(row["raw_phrase"], "unknown", "unknown")
+                    df.loc[i, "action"] = "approved"
+                    df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
+                    df.to_csv(NEW_TERMS_LOG, index=False)
+                    st.success("Approved and added.")
+                    st.experimental_rerun()
+
+                if c2.button(f"Reject {i}"):
+                    df.loc[i, "action"] = "rejected"
+                    df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
+                    df.to_csv(NEW_TERMS_LOG, index=False)
+                    st.warning("Rejected.")
+                    st.experimental_rerun()
+
+
+# ============================================================
+# DOWNLOAD UPDATED SUBSET
+# ============================================================
+st.subheader("📦 Download Updated Subset")
+
+def make_zip():
+    zip_path = f"{BASE_DIR}/subset_updated.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in ["descriptions_diabetes.tsv", "concepts_diabetes.tsv", "relationships_diabetes.tsv"]:
+            z.write(f"{BASE_DIR}/{f}", arcname=f)
+    return zip_path
+
+if st.button("Create ZIP"):
+    zp = make_zip()
+    with open(zp, "rb") as f:
+        st.download_button("Download ZIP", f, "subset_updated.zip")
+
+
+# ============================================================
+# PUSH BACK TO GITHUB
+# ============================================================
+with st.expander("🚀 Push Updated TSV to GitHub"):
+    repo = st.text_input("Repository (e.g. username/repo)")
+    token = st.text_input("GitHub Token", type="password")
+    file_to_push = f"{BASE_DIR}/descriptions_diabetes.tsv"
+
+    if st.button("Push to GitHub"):
+        if not repo or not token:
+            st.error("Missing repo or token")
+        else:
+            api_url = f"https://api.github.com/repos/{repo}/contents/descriptions_diabetes.tsv"
+
+            with open(file_to_push, "rb") as f:
+                content = base64.b64encode(f.read()).decode()
+
+            headers = {"Authorization": f"token {token}"}
+            resp = requests.get(api_url, headers=headers)
+            sha = resp.json().get("sha") if resp.status_code == 200 else None
+
+            payload = {"message": "Auto-update from Streamlit", "content": content, "branch": "main"}
+            if sha:
+                payload["sha"] = sha
+
+            r = requests.put(api_url, headers=headers, data=json.dumps(payload))
+
+            if r.status_code in [200, 201]:
+                st.success("Pushed to GitHub!")
+            else:
+                st.error(f"Error: {r.text}")
