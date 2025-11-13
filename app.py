@@ -118,8 +118,7 @@ return False, "none", float(max(zs_score, sim))
 def analyze_user_phrase(text):
 
 related, method, rel_score = is_diabetes_related(text)
-
- related, method, rel_score = is_diabetes_related(text_clean)
+related, method, rel_score = is_diabetes_related(text_clean)
 if not related:
 st.error(f"❌ Not diabetes-related (score={rel_score:.3f}, method={method})")
 return
