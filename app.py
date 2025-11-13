@@ -37,7 +37,7 @@ def load_models():
 
     return zero_shot, sap_tokenizer, sap_model
 
-zero_shot, sap_tokenizer, sap_model = load_models()
+    zero_shot, sap_tokenizer, sap_model = load_models()
 
 
 # ============================================================
@@ -94,22 +94,22 @@ diabetes_centroid = anchor_embs.mean(axis=0, keepdims=True)
 # ============================================================
 
 
-    # Zero-shot
-    zs = zero_shot(t, ["diabetes", "not_related"])
-    zs_label = zs["labels"][0]
-    zs_score = zs["scores"][0]
+# Zero-shot
+zs = zero_shot(t, ["diabetes", "not_related"])
+zs_label = zs["labels"][0]
+zs_score = zs["scores"][0]
 
-    if zs_label == "diabetes" and zs_score >= 0.70:
-        return True, "zero-shot", zs_score
+if zs_label == "diabetes" and zs_score >= 0.70:
+    return True, "zero-shot", zs_score
 
-    # Centroid similarity
-    emb = embed_sapbert([t])
-    sim = cosine_similarity(emb, diabetes_centroid)[0][0]
+# Centroid similarity
+emb = embed_sapbert([t])
+sim = cosine_similarity(emb, diabetes_centroid)[0][0]
 
-    if sim >= 0.70:
-        return True, "centroid", float(sim)
+if sim >= 0.70:
+    return True, "centroid", float(sim)
 
-    return False, "none", float(max(zs_score, sim))
+return False, "none", float(max(zs_score, sim))
 
 
 # ============================================================
