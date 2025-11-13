@@ -111,6 +111,26 @@ if sim >= 0.70:
 
 return False, "none", float(max(zs_score, sim))
 
+def is_diabetes_related(text):
+    t = text.lower().strip()
+
+    # 1️⃣ Zero-shot classification
+    zs = zero_shot(t, ["diabetes", "not_related"])
+    zs_label = zs["labels"][0]
+    zs_score = zs["scores"][0]
+
+    if zs_label == "diabetes" and zs_score >= 0.70:
+        return True, "zero-shot", zs_score
+
+    # 2️⃣ Diabetes centroid similarity
+    emb = embed_sapbert([t])
+    sim = cosine_similarity(emb, diabetes_centroid)[0][0]
+
+    if sim >= 0.70:
+        return True, "centroid", float(sim)
+
+    # Not diabetes-related
+    return False, "none", float(max(zs_score, sim))
 
 # ============================================================
 # SNOMED CT MATCHING
@@ -126,6 +146,37 @@ def analyze_user_phrase(text):
             "diabetes_related": False,
             "reason": f"Not diabetes-related (score={rel_score:.3f}, method={method})"
         }
+
+    # STEP 2 — SNOMED matching
+    user_emb = embed_sapbert([text_clean])
+    sims = cosine_similarity(user_emb, term_embeddings)[0]
+    idx = int(np.argmax(sims))
+
+    match_term = all_terms[idx]
+    match_id = concept_ids[idx]
+    sim_score = float(sims[idx])
+
+    # STEP 3 — Decision
+    if sim_score >= 0.85:
+        decision = "High match — existing SNOMED concept recognized"
+        matched = True
+    elif 0.60 <= sim_score < 0.85:
+        decision = "Medium match — possible child concept"
+        matched = True
+    else:
+        decision = "Low match — diabetes-related but NO suitable SNOMED concept found"
+        matched = False
+
+    return {
+        "diabetes_related": True,
+        "method": method,
+        "relevance_score": rel_score,
+        "matched": matched,
+        "decision": decision,
+        "concept": match_term if matched else None,
+        "conceptId": match_id if matched else None,
+        "similarity": sim_score
+    }
 
     # STEP 2 — SNOMED matching
     user_emb = embed_sapbert([text_clean])
