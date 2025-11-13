@@ -8,8 +8,8 @@ from transformers import AutoTokenizer, AutoModel
 from rapidfuzz import process, fuzz
 
 # =============== UI CONFIG ===============
-st.set_page_config(page_title="Diabetes Concept Matcher", page_icon="🩸")
-st.title("🩸 Diabetes Concept Matcher (SNOMED CT subset + SapBERT)")
+st.set_page_config(page_title="Folksonomized Ontology - SHCS")
+st.title("Semantic Mapping (SNOMED CT subset + SapBERT)")
 st.caption("Enter any tag/phrase. We’ll normalize, correct typos, and match to the closest diabetes concept.")
 
 # =============== SETTINGS ===============
