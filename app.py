@@ -24,14 +24,19 @@ NEW_TERMS_LOG = "new_terms_log.csv"
 
 
 # ============================================================
+# SESSION STATE: Prevent duplicate queue logging
+# ============================================================
+if "queued_phrases" not in st.session_state:
+    st.session_state["queued_phrases"] = set()
+
+
+# ============================================================
 # LOAD MODELS (CACHED)
 # ============================================================
 @st.cache_resource
 def load_models():
-    # Zero-shot
     zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
-    # SapBERT
     sap_name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
     sap_tokenizer = AutoTokenizer.from_pretrained(sap_name)
     sap_model = AutoModel.from_pretrained(sap_name)
@@ -44,7 +49,7 @@ zero_shot, sap_tokenizer, sap_model = load_models()
 
 
 # ============================================================
-# EMBEDDING HELPERS
+# SAPBERT EMBEDDING
 # ============================================================
 def embed_sapbert(texts):
     inputs = sap_tokenizer(texts, padding=True, truncation=True, return_tensors='pt')
@@ -109,7 +114,6 @@ diabetes_centroid = anchor_embs.mean(axis=0, keepdims=True)
 def is_diabetes_related(text):
     t = text.lower().strip()
 
-    # Zero-shot classification
     zs = zero_shot(t, ["diabetes", "not_related"])
     zs_label = zs["labels"][0]
     zs_score = zs["scores"][0]
@@ -117,7 +121,6 @@ def is_diabetes_related(text):
     if zs_label == "diabetes" and zs_score >= 0.70:
         return True, "zero-shot", zs_score
 
-    # Centroid similarity
     emb = embed_sapbert([t])
     sim = cosine_similarity(emb, diabetes_centroid)[0][0]
 
@@ -128,12 +131,11 @@ def is_diabetes_related(text):
 
 
 # ============================================================
-# FULL MATCHING PIPELINE
+# MATCHING FUNCTION
 # ============================================================
 def analyze_user_phrase(text):
     text_clean = text.lower().strip()
 
-    # STEP 1 — Diabetes relevance check
     related, method, rel_score = is_diabetes_related(text_clean)
 
     if not related:
@@ -142,7 +144,6 @@ def analyze_user_phrase(text):
             "reason": f"Not diabetes-related (score={rel_score:.3f}, method={method})"
         }
 
-    # STEP 2 — SNOMED matching
     user_emb = embed_sapbert([text_clean])
     sims = cosine_similarity(user_emb, term_embeddings)[0]
     idx = int(np.argmax(sims))
@@ -151,7 +152,6 @@ def analyze_user_phrase(text):
     match_id = concept_ids[idx]
     sim_score = float(sims[idx])
 
-    # STEP 3 — Decision
     if sim_score >= 0.85:
         decision = "High match — existing SNOMED concept recognized"
         matched = True
@@ -175,7 +175,7 @@ def analyze_user_phrase(text):
 
 
 # ============================================================
-# LOGGING
+# LOGGING (DEDUPLICATED)
 # ============================================================
 def init_new_terms_log():
     if not os.path.exists(NEW_TERMS_LOG):
@@ -189,6 +189,15 @@ def init_new_terms_log():
 
 def log_new_term(raw, term, cid, sim, action):
     init_new_terms_log()
+
+    raw_lower = raw.lower().strip()
+
+    df = pd.read_csv(NEW_TERMS_LOG)
+
+    # prevent duplicate queue entries
+    if raw_lower in df["raw_phrase"].astype(str).str.lower().values:
+        return
+
     with open(NEW_TERMS_LOG, "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -199,14 +208,13 @@ def log_new_term(raw, term, cid, sim, action):
 
 
 # ============================================================
-# APPEND NEW SYNONYM TO SUBSET
+# APPEND NEW PHRASE TO SUBSET
 # ============================================================
 def append_new_phrase_to_subset(raw_phrase, matched_term, matched_id):
     file_path = f"{BASE_DIR}/descriptions_diabetes.tsv"
     df = pd.read_csv(file_path, sep="\t", dtype=str)
 
     if raw_phrase.lower() in df["term"].astype(str).str.lower().values:
-        st.info("Term already exists.")
         return False
 
     new_row = {
@@ -253,15 +261,23 @@ if user_input:
                 if append_new_phrase_to_subset(user_input, res["concept"], res["conceptId"]):
                     st.success("Added to subset!")
                     log_new_term(user_input, res["concept"], res["conceptId"], res["similarity"], "added")
+
         else:
             st.warning("No suitable SNOMED concept found.")
+
             if st.checkbox("Queue this phrase for review?"):
-                log_new_term(user_input, "-", "-", res["relevance_score"], "queued")
-                st.success("Queued for review.")
+                key = user_input.lower().strip()
+
+                if key not in st.session_state["queued_phrases"]:
+                    log_new_term(user_input, "-", "-", res["relevance_score"], "queued")
+                    st.session_state["queued_phrases"].add(key)
+                    st.success("Queued for review.")
+                else:
+                    st.info("Already queued.")
 
 
 # ============================================================
-# ADMIN REVIEW
+# ADMIN REVIEW PANEL
 # ============================================================
 with st.expander("🔐 Admin Review"):
     if os.path.exists(NEW_TERMS_LOG):
@@ -275,19 +291,18 @@ with st.expander("🔐 Admin Review"):
                 st.write(f"**Phrase:** {row['raw_phrase']} | Score={row['similarity']}")
 
                 c1, c2 = st.columns(2)
+
                 if c1.button(f"Approve {i}"):
                     append_new_phrase_to_subset(row["raw_phrase"], "unknown", "unknown")
                     df.loc[i, "action"] = "approved"
                     df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
                     df.to_csv(NEW_TERMS_LOG, index=False)
-                    st.success("Approved and added.")
                     st.rerun()
 
                 if c2.button(f"Reject {i}"):
                     df.loc[i, "action"] = "rejected"
                     df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
                     df.to_csv(NEW_TERMS_LOG, index=False)
-                    st.warning("Rejected.")
                     st.rerun()
 
 
