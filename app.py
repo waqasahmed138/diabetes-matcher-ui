@@ -136,9 +136,28 @@ def is_diabetes_related(text):
 # ============================================================
 # MATCHING PIPELINE
 # ============================================================
-def analyze_user_phrase(text):
+
+    def analyze_user_phrase(text):
     text_clean = text.lower().strip()
 
+    # STEP 1 — Check if the phrase already exists as a synonym
+    existing_synonym = desc_df[desc_df["term"].str.lower() == text_clean]
+    if not existing_synonym.empty:
+        # If exists, return 100% similarity (synonym is already in the subset)
+        match_term = existing_synonym.iloc[0]["conceptId"]
+        sim_score = 1.0  # 100% similarity
+        return {
+            "diabetes_related": True,
+            "method": "existing synonym",
+            "relevance_score": 1.0,
+            "matched": True,
+            "decision": "High match — existing SNOMED concept recognized",
+            "concept": existing_synonym.iloc[0]["term"],
+            "conceptId": match_term,
+            "similarity": sim_score,
+        }
+
+    # If it's a new phrase, proceed with normal analysis:
     related, method, rel_score = is_diabetes_related(text_clean)
     if not related:
         return {
@@ -148,8 +167,8 @@ def analyze_user_phrase(text):
 
     user_emb = embed_sapbert([text_clean])
     sims = cosine_similarity(user_emb, term_embeddings)[0]
-
     idx = int(np.argmax(sims))
+
     match_term = all_terms[idx]
     match_id = concept_ids[idx]
     sim_score = float(sims[idx])
@@ -174,6 +193,7 @@ def analyze_user_phrase(text):
         "conceptId": match_id if matched else None,
         "similarity": sim_score,
     }
+
 
 
 # ============================================================
