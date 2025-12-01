@@ -136,8 +136,7 @@ def is_diabetes_related(text):
 # ============================================================
 # MATCHING PIPELINE
 # ============================================================
-
-    def analyze_user_phrase(text):
+def analyze_user_phrase(text):
     text_clean = text.lower().strip()
 
     # STEP 1 — Check if the phrase already exists as a synonym
@@ -193,7 +192,6 @@ def is_diabetes_related(text):
         "conceptId": match_id if matched else None,
         "similarity": sim_score,
     }
-
 
 
 # ============================================================
