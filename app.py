@@ -281,14 +281,14 @@ with st.expander("🔐 Admin Review"):
                     df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
                     df.to_csv(NEW_TERMS_LOG, index=False)
                     st.success("Approved and added.")
-                    st.experimental_rerun()
+                    st.rerun()
 
                 if c2.button(f"Reject {i}"):
                     df.loc[i, "action"] = "rejected"
                     df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
                     df.to_csv(NEW_TERMS_LOG, index=False)
                     st.warning("Rejected.")
-                    st.experimental_rerun()
+                    st.rerun()
 
 
 # ============================================================
