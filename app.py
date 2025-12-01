@@ -136,7 +136,7 @@ def is_diabetes_related(text):
 # ============================================================
 # MATCHING PIPELINE
 # ============================================================
-def analyze_user_phrase(text):
+def analyze_user_phrase(text, desc_df):
     text_clean = text.lower().strip()
 
     # STEP 1 — Check if the phrase already exists as a synonym
@@ -258,7 +258,7 @@ st.title("🩸 Hybrid Diabetes Concept Matcher (AI + SNOMED CT)")
 user_input = st.text_input("Enter a tag or phrase (e.g., 'my sugar is high today')")
 
 if user_input:
-    res = analyze_user_phrase(user_input)
+    res = analyze_user_phrase(user_input, descriptions)
 
     if not res["diabetes_related"]:
         st.error(res["reason"])
