@@ -63,12 +63,12 @@ def embed_sapbert(texts):
         texts,
         padding=True,
         truncation=True,
-        max_length=64,         # <-- ADD THIS
-        return_tensors='pt'
+        return_tensors="pt",
     )
     with torch.no_grad():
         out = sap_model(**inputs)
     return out.last_hidden_state[:, 0, :].cpu().numpy()
+
 
 # ============================================================
 # LOAD SNOMED RF2 SUBSET
