@@ -9,6 +9,13 @@ import requests
 import json
 import re
 from datetime import datetime
+import ctypes
+
+# Workaround for WinError 1114: Load libiomp5md.dll before importing torch
+try:
+    ctypes.CDLL(r"C:\Users\Aqib Rehman\AppData\Local\Programs\Python\Python314\Lib\site-packages\torch\lib\libiomp5md.dll")
+except Exception:
+    pass
 
 from transformers import AutoTokenizer, AutoModel, pipeline
 import torch
@@ -18,13 +25,20 @@ import matplotlib.pyplot as plt
 
 
 # ============================================================
-# PAGE CONFIG
+# CONFIG
 # ============================================================
-st.set_page_config(page_title="Diabetes Concept Matcher", page_icon="🩸")
+st.set_page_config(page_title="Diabetes Concept Matcher", page_icon="🩸", layout="wide")
 
 BASE_DIR = "./diabetes_subset_rf2"
 NEW_TERMS_LOG = "new_terms_log.csv"
 UMLS_FILE = f"{BASE_DIR}/UMLS_DIABETES_CLEAN.tsv"
+
+AUTO_THRESHOLD = 0.80
+REVIEW_THRESHOLD = 0.70
+
+DESC_PATH = f"{BASE_DIR}/descriptions_diabetes.tsv"
+CON_PATH = f"{BASE_DIR}/concepts_diabetes.tsv"
+REL_PATH = f"{BASE_DIR}/relationships_diabetes.tsv"
 
 
 # ============================================================
@@ -35,14 +49,11 @@ if "queued_phrases" not in st.session_state:
 
 
 # ============================================================
-# LOAD MODELS
+# LOAD MODELS (CACHED)
 # ============================================================
 @st.cache_resource
 def load_models():
-    zero_shot = pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli",
-    )
+    zero_shot = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
 
     sap_name = "cambridgeltl/SapBERT-from-PubMedBERT-fulltext"
     sap_tokenizer = AutoTokenizer.from_pretrained(sap_name)
@@ -56,13 +67,14 @@ zero_shot, sap_tokenizer, sap_model = load_models()
 
 
 # ============================================================
-# SAPBERT EMBEDDING
+# EMBEDDING
 # ============================================================
 def embed_sapbert(texts):
     inputs = sap_tokenizer(
         texts,
         padding=True,
         truncation=True,
+        max_length=64,  # stable + removes HF warning
         return_tensors="pt",
     )
     with torch.no_grad():
@@ -71,25 +83,13 @@ def embed_sapbert(texts):
 
 
 # ============================================================
-# LOAD SNOMED RF2 SUBSET
+# LOAD DATA
 # ============================================================
 @st.cache_data
 def load_rf2(base_dir):
-    desc = pd.read_csv(
-        f"{base_dir}/descriptions_diabetes.tsv",
-        sep="\t",
-        dtype=str,
-    )
-    con = pd.read_csv(
-        f"{base_dir}/concepts_diabetes.tsv",
-        sep="\t",
-        dtype=str,
-    )
-    rel = pd.read_csv(
-        f"{base_dir}/relationships_diabetes.tsv",
-        sep="\t",
-        dtype=str,
-    )
+    desc = pd.read_csv(DESC_PATH, sep="\t", dtype=str)
+    con = pd.read_csv(CON_PATH, sep="\t", dtype=str)
+    rel = pd.read_csv(REL_PATH, sep="\t", dtype=str)
 
     desc = desc[desc["active"] == "1"]
 
@@ -102,9 +102,6 @@ def load_rf2(base_dir):
 descriptions, concepts, relationships, all_terms, concept_ids = load_rf2(BASE_DIR)
 
 
-# ============================================================
-# PRECOMPUTE SNOMED TERM EMBEDDINGS
-# ============================================================
 @st.cache_resource
 def get_term_embeddings(terms):
     if not terms:
@@ -115,9 +112,6 @@ def get_term_embeddings(terms):
 term_embeddings = get_term_embeddings(all_terms)
 
 
-# ============================================================
-# LOAD UMLS DIABETES SUBSET
-# ============================================================
 @st.cache_data
 def load_umls_subset(path):
     if not os.path.exists(path):
@@ -125,12 +119,10 @@ def load_umls_subset(path):
 
     df = pd.read_csv(path, sep="\t", dtype=str)
     df = df.dropna(subset=["CUI", "STR"])
-    df["STR"] = df["STR"].astype(str)
     df["CUI"] = df["CUI"].astype(str)
+    df["STR"] = df["STR"].astype(str)
 
-    terms = df["STR"].tolist()
-    cuis = df["CUI"].tolist()
-    return df, terms, cuis
+    return df, df["STR"].tolist(), df["CUI"].tolist()
 
 
 umls_df, umls_terms, umls_cuis = load_umls_subset(UMLS_FILE)
@@ -147,7 +139,7 @@ umls_embeddings = get_umls_embeddings(umls_terms)
 
 
 # ============================================================
-# MEDICAL ABBREVIATIONS
+# TEXT NORMALIZATION (OPTION C)
 # ============================================================
 MEDICAL_ABBREVS = {
     "dm": "diabetes mellitus",
@@ -157,13 +149,26 @@ MEDICAL_ABBREVS = {
     "bg": "blood glucose",
     "bs": "blood sugar",
     "hba1c": "hemoglobin a1c",
-    "gtt": "glucose tolerance test",
+}
+
+STOPWORDS = {
+    "i", "im", "me", "my", "mine", "you", "u", "your", "yours",
+    "he", "she", "they", "them", "we", "us", "our", "ours",
+    "am", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did",
+    "will", "would", "shall", "should", "can", "could",
+    "may", "might", "must",
+    "feel", "feeling", "felt", "get", "got", "getting",
+    "a", "an", "the", "this", "that", "these", "those",
+    "very", "so", "too", "much", "lot", "little", "bit",
+    "of", "in", "on", "at", "for", "from", "to", "with",
+    "without", "after", "before", "during", "since", "because",
+    "but", "if", "when", "while", "and", "or", "as", "like",
+    "just", "today", "yesterday", "tomorrow", "now", "right",
+    "really", "also", "again", "please", "plz", "kindly",
 }
 
 
-# ============================================================
-# MEDICAL VOCAB (FROM SNOMED + UMLS + ABBREVS) — OPTION C
-# ============================================================
 @st.cache_resource
 def build_medical_vocab(snomed_terms, umls_terms, abbrev_map):
     vocab = set()
@@ -186,42 +191,14 @@ def build_medical_vocab(snomed_terms, umls_terms, abbrev_map):
 medical_vocab = build_medical_vocab(all_terms, umls_terms, MEDICAL_ABBREVS)
 
 
-# Strong stopword list for aggressive clinical filtering
-STOPWORDS = {
-    "i", "im", "me", "my", "mine", "you", "u", "your", "yours",
-    "he", "she", "they", "them", "we", "us", "our", "ours",
-    "am", "is", "are", "was", "were", "be", "been", "being",
-    "have", "has", "had", "do", "does", "did",
-    "will", "would", "shall", "should", "can", "could",
-    "may", "might", "must",
-    "feel", "feeling", "felt", "get", "got", "getting",
-    "a", "an", "the", "this", "that", "these", "those",
-    "very", "so", "too", "much", "lot", "little", "bit",
-    "of", "in", "on", "at", "for", "from", "to", "with",
-    "without", "after", "before", "during", "since", "because",
-    "but", "if", "when", "while", "and", "or", "as", "like",
-    "just", "today", "yesterday", "tomorrow", "now", "right",
-    "really", "also", "again", "please", "plz", "kindly",
-    "bro", "yar", "yaar", "bhai", "g",
-    "meri", "mera", "mere", "bohot", "bahut", "zyada", "kam",
-}
-
-
-# ============================================================
-# TEXT PREPROCESSING (OPTION C)
-# ============================================================
 def preprocess_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
+    t = text.lower().strip()
 
-    t = text.lower()
-
-    # expand abbreviations
     for abbr, full in MEDICAL_ABBREVS.items():
-        pattern = r"\b" + re.escape(abbr) + r"\b"
-        t = re.sub(pattern, full, t)
+        t = re.sub(rf"\b{re.escape(abbr)}\b", full, t)
 
-    # keep letters, digits and spaces
     t = re.sub(r"[^a-z0-9\s]", " ", t)
 
     tokens = t.split()
@@ -231,17 +208,14 @@ def preprocess_text(text: str) -> str:
         if tok in STOPWORDS:
             continue
 
-        # numeric lab values
         if re.match(r"^\d+(\.\d+)?(mg|mmol|ml|mgdl|mmoll)?$", tok):
             cleaned.append(tok)
             continue
 
-        # medical vocab hit
         if tok in medical_vocab:
             cleaned.append(tok)
             continue
 
-        # long token that looks clinical
         if re.match(r"^[a-z]{6,}$", tok):
             cleaned.append(tok)
 
@@ -252,28 +226,21 @@ def preprocess_text(text: str) -> str:
 
 
 # ============================================================
-# DIABETES CENTROID VECTOR
+# DIABETES RELEVANCE (ZERO-SHOT + CENTROID)
 # ============================================================
 diabetes_anchors = [
     "diabetes",
     "diabetes mellitus",
-    "type 2 diabetes",
-    "type 1 diabetes",
+    "type 2 diabetes mellitus",
+    "type 1 diabetes mellitus",
     "hyperglycemia",
+    "hypoglycemia",
+    "blood glucose",
     "insulin resistance",
-    "glucose intolerance",
-    "high blood sugar",
-    "low insulin",
-    "increased glucose",
 ]
-
-anchor_embs = embed_sapbert(diabetes_anchors)
-diabetes_centroid = anchor_embs.mean(axis=0, keepdims=True)
+diabetes_centroid = embed_sapbert(diabetes_anchors).mean(axis=0, keepdims=True)
 
 
-# ============================================================
-# HYBRID DIABETES RELEVANCE CHECK
-# ============================================================
 def is_diabetes_related(text_clean: str):
     t = text_clean.lower().strip()
 
@@ -281,21 +248,20 @@ def is_diabetes_related(text_clean: str):
     zs_label = zs["labels"][0]
     zs_score = zs["scores"][0]
 
-    if zs_label == "diabetes" and zs_score >= 0.70:
+    if zs_label == "diabetes" and zs_score >= REVIEW_THRESHOLD:
         return True, "zero-shot", float(zs_score)
 
-    emb = embed_sapbert([t])
-    sim = cosine_similarity(emb, diabetes_centroid)[0][0]
-
-    if sim >= 0.70:
-        return True, "centroid", float(sim)
+    sim = float(cosine_similarity(embed_sapbert([t]), diabetes_centroid)[0][0])
+    if sim >= REVIEW_THRESHOLD:
+        return True, "centroid", sim
 
     return False, "none", float(max(zs_score, sim))
+
+
 # ============================================================
 # UMLS MATCH HELPERS
 # ============================================================
 def umls_exact_match(text_clean: str):
-    """Exact string match inside UMLS diabetes subset."""
     if umls_df.empty:
         return None
 
@@ -304,16 +270,10 @@ def umls_exact_match(text_clean: str):
         return None
 
     row = umls_df[mask].iloc[0]
-    return {
-        "term": row["STR"],
-        "cui": row["CUI"],
-        "similarity": 1.0,
-        "mode": "exact",
-    }
+    return {"term": row["STR"], "cui": row["CUI"], "similarity": 1.0, "mode": "exact"}
 
 
 def umls_embedding_match(text_clean: str):
-    """SapBERT similarity match against UMLS diabetes terms."""
     if umls_embeddings.shape[0] == 0:
         return None
 
@@ -330,241 +290,60 @@ def umls_embedding_match(text_clean: str):
 
 
 # ============================================================
-# MAIN MATCHING PIPELINE (SNOMED + UMLS + SapBERT)
-# ============================================================
-def analyze_user_phrase(raw_text: str, desc_df: pd.DataFrame):
-    """
-    Full decision pipeline.
-
-    1) Preprocess input (Option C).
-    2) If exact SNOMED synonym → 100% match.
-    3) Check diabetes relevance.
-    4) SNOMED SapBERT similarity.
-    5) UMLS fallback (exact + similarity).
-    6) Choose best candidate.
-    7) Thresholds:
-       - >= 0.80 → auto
-       - 0.70–0.79 → review
-       - < 0.70 → discard
-    """
-
-    # 0. preprocess
-    text_clean = preprocess_text(raw_text)
-
-    # 1. exact SNOMED synonym already present
-    df_terms = desc_df["term"].astype(str).str.strip().str.lower()
-    if text_clean in df_terms.values:
-        row = desc_df[df_terms == text_clean].iloc[0]
-        cid = row["conceptId"]
-        term = row["term"]
-
-        return {
-            "diabetes_related": True,
-            "rel_method": "exact-snomed-synonym",
-            "relevance_score": 1.0,
-            "existing_synonym": True,
-            "decision_class": "auto",
-            "snomed": {
-                "matched": True,
-                "decision": "Exact SNOMED synonym found",
-                "concept": term,
-                "conceptId": cid,
-                "similarity": 1.0,
-            },
-            "umls": {
-                "available": not umls_df.empty,
-                "matched": False,
-                "decision": None,
-                "concept": None,
-                "cui": None,
-                "similarity": None,
-            },
-            "final": {
-                "source": "SNOMED",
-                "concept": term,
-                "id": cid,
-                "similarity": 1.0,
-                "confidence": "high",
-            },
-        }
-
-    # 2. diabetes relevance check
-    related, rel_method, rel_score = is_diabetes_related(text_clean)
-    if not related:
-        return {
-            "diabetes_related": False,
-            "reason": f"Not diabetes-related (score={rel_score:.3f}, method={rel_method})",
-        }
-
-    # 3. SNOMED embedding match
-    user_emb = embed_sapbert([text_clean])
-
-    if term_embeddings.shape[0] == 0:
-        snomed_concept = None
-        snomed_id = None
-        snomed_sim = 0.0
-    else:
-        snomed_sims = cosine_similarity(user_emb, term_embeddings)[0]
-        snomed_idx = int(np.argmax(snomed_sims))
-        snomed_concept = all_terms[snomed_idx]
-        snomed_id = concept_ids[snomed_idx]
-        snomed_sim = float(snomed_sims[snomed_idx])
-
-    if snomed_sim >= 0.80:
-        snomed_decision = "High match — SNOMED concept auto-accepted (≥ 0.80)"
-    elif snomed_sim >= 0.70:
-        snomed_decision = "Borderline SNOMED match (0.70–0.79)"
-    else:
-        snomed_decision = "Low SNOMED similarity (< 0.70)"
-
-    # 4. UMLS (exact, then embedding)
-    umls_info = None
-    umls_decision = None
-    umls_sim_val = -1.0
-
-    exact = umls_exact_match(text_clean)
-    if exact is not None:
-        umls_info = exact
-        umls_decision = "Exact UMLS diabetes concept"
-        umls_sim_val = 1.0
-    else:
-        emb_match = umls_embedding_match(text_clean)
-        if emb_match is not None:
-            umls_info = emb_match
-            umls_sim_val = emb_match["similarity"]
-            if umls_sim_val >= 0.80:
-                umls_decision = "High match — UMLS diabetes concept (≥ 0.80)"
-            elif umls_sim_val >= 0.70:
-                umls_decision = "Borderline UMLS match (0.70–0.79)"
-            else:
-                umls_decision = "Low UMLS similarity (< 0.70)"
-
-    # 5. choose best candidate across SNOMED + UMLS
-    best_source = None
-    best_concept = None
-    best_id = None
-    best_sim = 0.0
-    best_conf = "low"
-
-    if snomed_sim >= umls_sim_val:
-        best_source = "SNOMED"
-        best_concept = snomed_concept
-        best_id = snomed_id
-        best_sim = snomed_sim
-    else:
-        if umls_info is not None:
-            best_source = "UMLS"
-            best_concept = umls_info["term"]
-            best_id = umls_info["cui"]
-            best_sim = umls_info["similarity"]
-
-    # 6. decision class based on best_sim
-    if best_source is None or best_concept is None:
-        decision_class = "discard"
-        best_sim = 0.0
-        best_conf = "low"
-    else:
-        if best_sim >= 0.80:
-            decision_class = "auto"
-            best_conf = "high"
-        elif best_sim >= 0.70:
-            decision_class = "review"
-            best_conf = "medium"
-        else:
-            decision_class = "discard"
-            best_conf = "low"
-
-    return {
-        "diabetes_related": True,
-        "rel_method": rel_method,
-        "relevance_score": rel_score,
-        "existing_synonym": False,
-        "decision_class": decision_class,
-        "snomed": {
-            "matched": snomed_concept is not None,
-            "decision": snomed_decision,
-            "concept": snomed_concept,
-            "conceptId": snomed_id,
-            "similarity": snomed_sim,
-        },
-        "umls": {
-            "available": not umls_df.empty,
-            "matched": umls_info is not None,
-            "decision": umls_decision,
-            "concept": umls_info["term"] if umls_info else None,
-            "cui": umls_info["cui"] if umls_info else None,
-            "similarity": umls_sim_val if umls_info else None,
-        },
-        "final": {
-            "source": best_source,
-            "concept": best_concept,
-            "id": best_id,
-            "similarity": best_sim,
-            "confidence": best_conf,
-        },
-    }
-
-
-# ============================================================
-# LOGGING SYSTEM
+# LOGGING
 # ============================================================
 def init_new_terms_log():
     if not os.path.exists(NEW_TERMS_LOG):
         with open(NEW_TERMS_LOG, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(
-                [
-                    "timestamp",
-                    "raw_phrase",
-                    "matched_term",
-                    "concept_id",
-                    "similarity",
-                    "action",
-                    "reviewer",
-                    "review_time",
-                ]
-            )
+            writer.writerow([
+                "timestamp",
+                "raw_phrase",
+                "clean_phrase",
+                "matched_term",
+                "concept_id",
+                "source",
+                "similarity",
+                "action",
+                "review_time",
+            ])
 
 
-def log_new_term(raw, term, cid, sim, action):
+def log_new_term(raw, clean, term, cid, source, sim, action):
     init_new_terms_log()
 
-    df = pd.read_csv(NEW_TERMS_LOG)
-    if raw.lower() in df["raw_phrase"].astype(str).str.lower().values:
-        return
+    if os.path.exists(NEW_TERMS_LOG):
+        df = pd.read_csv(NEW_TERMS_LOG)
+        if raw.lower().strip() in df["raw_phrase"].astype(str).str.lower().values and action == "queued":
+            return
 
     with open(NEW_TERMS_LOG, "a", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(
-            [
-                datetime.now().isoformat(timespec="seconds"),
-                raw,
-                term,
-                cid,
-                f"{sim:.3f}",
-                action,
-                "",
-                "",
-            ]
-        )
+        writer.writerow([
+            datetime.now().isoformat(timespec="seconds"),
+            raw,
+            clean,
+            term,
+            cid,
+            source,
+            f"{float(sim):.3f}",
+            action,
+            "",
+        ])
 
 
 # ============================================================
-# ADD SYNONYM TO SNOMED RF2 (Parent Mapping)
+# ADD SYNONYM TO SNOMED SUBSET
 # ============================================================
-def append_new_phrase_to_subset(raw_phrase, parent_concept, parent_concept_id):
-    """
-    Add user phrase as a new SNOMED synonym under the chosen parent concept.
-    Also update in-memory descriptions, term list and embeddings for live use.
-    """
-    global descriptions, all_terms, term_embeddings
+def append_new_phrase_to_subset(raw_phrase, parent_concept_id):
+    global descriptions, all_terms, concept_ids, term_embeddings
 
-    file_path = f"{BASE_DIR}/descriptions_diabetes.tsv"
-    df = pd.read_csv(file_path, sep="\t", dtype=str)
+    df = pd.read_csv(DESC_PATH, sep="\t", dtype=str)
 
-    text_clean = preprocess_text(raw_phrase)
+    clean = preprocess_text(raw_phrase)
     df_terms = df["term"].astype(str).str.strip().str.lower()
-    if text_clean in df_terms.values:
+
+    if clean in df_terms.values:
         return False
 
     new_row = {
@@ -580,178 +359,264 @@ def append_new_phrase_to_subset(raw_phrase, parent_concept, parent_concept_id):
     }
 
     df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-    df.to_csv(file_path, sep="\t", index=False)
+    df.to_csv(DESC_PATH, sep="\t", index=False)
 
-    # update in-memory copies
-    descriptions = pd.concat(
-        [descriptions, pd.DataFrame([new_row])],
-        ignore_index=True,
-    )
+    descriptions = pd.concat([descriptions, pd.DataFrame([new_row])], ignore_index=True)
+
     all_terms.append(raw_phrase)
+    concept_ids.append(parent_concept_id)
+
     new_emb = embed_sapbert([raw_phrase])
     if term_embeddings.shape[0] == 0:
-        term_embeddings_new = new_emb
+        term_embeddings = new_emb
     else:
-        term_embeddings_new = np.vstack([term_embeddings, new_emb])
-    # reassign cached embeddings
-    globals()["term_embeddings"] = term_embeddings_new
+        term_embeddings = np.vstack([term_embeddings, new_emb])
 
     return True
-# ============================================================
-# MAIN USER INTERFACE
-# ============================================================
-st.title("🩸 Hybrid Diabetes Concept Matcher (SNOMED CT + UMLS + SapBERT)")
-
-st.write("Enter a clinical phrase. Example:")
-st.code("my sugar is high today, feet burning, shaky after meals")
-
-# USER INPUT
-user_input = st.text_input("Phrase:", key="text_input")
-
-# SUBMIT BUTTON (required, no auto-run)
-run_btn = st.button("🔎 Analyze Phrase")
 
 
 # ============================================================
-# RUN ANALYSIS ONLY WHEN BUTTON CLICKED
+# MATCHING PIPELINE
 # ============================================================
-if run_btn and user_input.strip() != "":
+def analyze_user_phrase(raw_text: str, desc_df: pd.DataFrame):
+    clean = preprocess_text(raw_text)
+
+    # 1) exact SNOMED synonym -> 1.0
+    df_terms = desc_df["term"].astype(str).str.strip().str.lower()
+    if clean in df_terms.values:
+        row = desc_df[df_terms == clean].iloc[0]
+        cid = row["conceptId"]
+        return {
+            "diabetes_related": True,
+            "clean": clean,
+            "rel_method": "exact-snomed-synonym",
+            "relevance_score": 1.0,
+            "decision_class": "auto",
+            "final": {"source": "SNOMED", "term": row["term"], "id": cid, "sim": 1.0},
+            "snomed": {"term": row["term"], "id": cid, "sim": 1.0, "decision": "Exact synonym"},
+            "umls": None,
+        }
+
+    # 2) diabetes relevance
+    related, rel_method, rel_score = is_diabetes_related(clean)
+    if not related:
+        return {
+            "diabetes_related": False,
+            "reason": f"Not diabetes-related (score={rel_score:.3f}, method={rel_method})",
+        }
+
+    # 3) SNOMED embedding
+    user_emb = embed_sapbert([clean])
+
+    sn_term, sn_id, sn_sim = None, None, 0.0
+    if term_embeddings.shape[0] > 0:
+        sn_sims = cosine_similarity(user_emb, term_embeddings)[0]
+        sn_i = int(np.argmax(sn_sims))
+        sn_term = all_terms[sn_i]
+        sn_id = concept_ids[sn_i]
+        sn_sim = float(sn_sims[sn_i])
+
+    if sn_sim >= AUTO_THRESHOLD:
+        sn_dec = "High SNOMED match (≥ 0.80)"
+    elif sn_sim >= REVIEW_THRESHOLD:
+        sn_dec = "Borderline SNOMED match (0.70–0.79)"
+    else:
+        sn_dec = "Low SNOMED similarity (< 0.70)"
+
+    # 4) UMLS fallback
+    um = None
+    um_sim = -1.0
+
+    um_exact = umls_exact_match(clean)
+    if um_exact is not None:
+        um = um_exact
+        um_sim = 1.0
+    else:
+        um_emb = umls_embedding_match(clean)
+        if um_emb is not None:
+            um = um_emb
+            um_sim = float(um_emb["similarity"])
+
+    # 5) final choice
+    if sn_sim >= um_sim:
+        final_source = "SNOMED"
+        final_term = sn_term
+        final_id = sn_id
+        final_sim = sn_sim
+    else:
+        final_source = "UMLS"
+        final_term = um["term"] if um else None
+        final_id = um["cui"] if um else None
+        final_sim = um_sim
+
+    # 6) decision class
+    if final_term is None:
+        decision_class = "discard"
+    elif final_sim >= AUTO_THRESHOLD:
+        decision_class = "auto"
+    elif final_sim >= REVIEW_THRESHOLD:
+        decision_class = "review"
+    else:
+        decision_class = "discard"
+
+    return {
+        "diabetes_related": True,
+        "clean": clean,
+        "rel_method": rel_method,
+        "relevance_score": rel_score,
+        "decision_class": decision_class,
+        "final": {"source": final_source, "term": final_term, "id": final_id, "sim": float(final_sim)},
+        "snomed": {"term": sn_term, "id": sn_id, "sim": float(sn_sim), "decision": sn_dec},
+        "umls": um,
+    }
+
+
+# ============================================================
+# UI
+# ============================================================
+st.title("🩸 Diabetes Concept Matcher (SNOMED CT + UMLS)")
+st.caption("Run locally in Antigravity IDE:  streamlit run app.py")
+
+colA, colB = st.columns([2, 1])
+
+with colA:
+    user_input = st.text_input("Enter a phrase:", placeholder="e.g., my sugar is high today, shaky after meals")
+    run_btn = st.button("🔎 Analyze Phrase")
+
+with colB:
+    st.markdown("### Thresholds")
+    st.write(f"✅ Auto-map: **≥ {AUTO_THRESHOLD:.2f}**")
+    st.write(f"🔎 Review: **{REVIEW_THRESHOLD:.2f}–{AUTO_THRESHOLD-0.01:.2f}**")
+    st.write(f"❌ Discard: **< {REVIEW_THRESHOLD:.2f}**")
+
+
+if run_btn and user_input.strip():
     res = analyze_user_phrase(user_input, descriptions)
 
     if not res["diabetes_related"]:
         st.error(res["reason"])
     else:
-        st.success(f"Diabetes-related (method={res['rel_method']}, score={res['relevance_score']:.3f})")
+        st.success(f"Diabetes-related ({res['rel_method']}, score={res['relevance_score']:.3f})")
+        st.write(f"**Cleaned input:** `{res['clean']}`")
 
-        st.markdown("## 🧬 SNOMED CT Match")
+        left, right = st.columns(2)
 
-        sn = res["snomed"]
-        st.write(f"**Decision:** {sn['decision']}")
-        st.write(f"**Best SNOMED concept:** {sn['concept']}")
-        st.write(f"**Concept ID:** `{sn['conceptId']}`")
-        st.write(f"**Similarity:** `{sn['similarity']:.3f}`")
+        with left:
+            st.subheader("SNOMED CT")
+            sn = res["snomed"]
+            st.write(f"Decision: **{sn['decision']}**")
+            st.write(f"Concept: **{sn['term']}**")
+            st.write(f"Concept ID: `{sn['id']}`")
+            st.write(f"Similarity: `{sn['sim']:.3f}`")
 
-        st.markdown("## 🧬 UMLS Match (Fallback)")
-
-        umls = res["umls"]
-        if umls["available"]:
-            if umls["matched"]:
-                st.info(f"**Matched UMLS term:** {umls['concept']} (CUI: `{umls['cui']}`)")
-                st.write(f"Similarity: `{umls['similarity']}`")
-                st.write(f"Decision: {umls['decision']}")
+        with right:
+            st.subheader("UMLS (Fallback)")
+            if res["umls"] is None:
+                st.info("No UMLS candidate (or file missing).")
             else:
-                st.warning("No UMLS match found")
-        else:
-            st.warning("UMLS file not loaded")
+                st.write(f"Term: **{res['umls']['term']}**")
+                st.write(f"CUI: `{res['umls']['cui']}`")
+                st.write(f"Similarity: `{float(res['umls']['similarity']):.3f}`")
+                st.write(f"Mode: `{res['umls']['mode']}`")
 
-        st.markdown("## ✅ Final Suggested Concept")
-
+        st.subheader("Final Suggestion")
         f = res["final"]
-        if f["source"] is None:
-            st.error("❌ No suitable SNOMED or UMLS concept. Tag discarded (<0.70).")
-        else:
-            st.success(
-                f"Source: **{f['source']}** — Concept: **{f['concept']}** "
-                f"(`{f['id']}`), similarity: `{f['similarity']:.3f}` "
-                f"({f['confidence']} confidence)"
-            )
+        st.success(f"Source: **{f['source']}** | Concept: **{f['term']}** (`{f['id']}`) | Similarity: `{f['sim']:.3f}`")
 
-        # ====================================================
-        # HANDLE ADDING SYNONYM TO SNOMED
-        # ====================================================
         if res["decision_class"] == "auto":
-            st.markdown("### ➕ Auto-Add to SNOMED?")
-            if st.checkbox(
-                f"Add this phrase as a new SNOMED synonym "
-                f"(parent: {f['concept']} / {f['id']})"
-            ):
-                success = append_new_phrase_to_subset(user_input, f["concept"], f["id"])
-                if success:
-                    st.success("Added as SNOMED synonym.")
-                    log_new_term(user_input, f["concept"], f["id"], f["similarity"], "added")
-                else:
-                    st.info("This term already exists in the SNOMED subset.")
-
+            st.info("Auto-map path (≥ 0.80). You may add it as synonym if SNOMED source.")
+            if f["source"] == "SNOMED":
+                if st.checkbox("➕ Add as new SNOMED synonym"):
+                    ok = append_new_phrase_to_subset(user_input, f["id"])
+                    if ok:
+                        st.success("Added to SNOMED subset.")
+                        log_new_term(user_input, res["clean"], f["term"], f["id"], f["source"], f["sim"], "added")
+                    else:
+                        st.warning("Already exists in subset.")
         elif res["decision_class"] == "review":
-            st.warning("🔎 Borderline similarity (0.70–0.79). Requires admin review.")
-
-            if st.checkbox("Queue this phrase for review?"):
+            st.warning("Review path (0.70–0.79). Queue for admin review.")
+            if st.checkbox("Queue for review"):
                 key = user_input.lower().strip()
                 if key not in st.session_state["queued_phrases"]:
-                    log_new_term(
-                        user_input,
-                        f["concept"],
-                        f["id"],
-                        f["similarity"],
-                        "queued"
-                    )
+                    log_new_term(user_input, res["clean"], f["term"], f["id"], f["source"], f["sim"], "queued")
                     st.session_state["queued_phrases"].add(key)
-                    st.success("Queued for admin review.")
+                    st.success("Queued.")
                 else:
                     st.info("Already queued.")
-
         else:
-            st.error("❌ Similarity < 0.70 — discarded as non-actionable.")
+            st.error("Discarded (<0.70).")
+            log_new_term(user_input, res["clean"], f.get("term", "-"), f.get("id", "-"), f.get("source", "-"), f.get("sim", 0.0), "discarded")
 
 
 # ============================================================
-# ADMIN REVIEW SECTION
+# ADMIN REVIEW PANEL
 # ============================================================
-st.markdown("## 🔐 Admin Review (Approve / Reject Queued Phrases)")
+st.divider()
+st.header("🔐 Admin Review")
 
-with st.expander("Admin Review Panel"):
-    if os.path.exists(NEW_TERMS_LOG):
+with st.expander("Open Admin Panel (Approve / Reject)"):
+    if not os.path.exists(NEW_TERMS_LOG):
+        st.info("No log file yet.")
+    else:
         df = pd.read_csv(NEW_TERMS_LOG)
 
-        # Remove duplicates (keep latest)
-        df["lower"] = df["raw_phrase"].str.lower()
+        # keep latest per raw_phrase
+        df["lower"] = df["raw_phrase"].astype(str).str.lower()
         df = df.sort_values("timestamp")
         df = df[~df["lower"].duplicated(keep="last")].drop(columns=["lower"])
         df.to_csv(NEW_TERMS_LOG, index=False)
 
-        pending = df[df["action"] == "queued"]
+        pending = df[df["action"] == "queued"].reset_index(drop=True)
 
         if pending.empty:
             st.info("No queued items.")
         else:
-            pending = pending.reset_index(drop=True)
-
             for i, row in pending.iterrows():
                 phrase = row["raw_phrase"]
+                clean = row["clean_phrase"]
                 term = row["matched_term"]
                 cid = row["concept_id"]
+                source = row["source"]
                 score = row["similarity"]
 
-                st.write(f"### Phrase: {phrase}")
-                st.write(f"Suggested Parent Concept: **{term}** (`{cid}`)")
-                st.write(f"Similarity: `{score}`")
+                st.markdown(f"### Phrase: {phrase}")
+                st.write(f"Clean: `{clean}`")
+                st.write(f"Suggested: **{term}** | ID: `{cid}` | Source: **{source}** | Similarity: `{score}`")
 
                 c1, c2 = st.columns(2)
+                if c1.button("Approve", key=f"ap_{i}"):
+                    # Only add to SNOMED subset if concept_id looks like a SNOMED conceptId
+                    # If source==UMLS, we still approve but we do NOT create a new SNOMED concept here
+                    if source == "SNOMED" and isinstance(cid, str) and cid.strip() != "":
+                        ok = append_new_phrase_to_subset(phrase, cid)
+                        if ok:
+                            st.success("Approved and added as SNOMED synonym.")
+                        else:
+                            st.warning("Already exists.")
+                    else:
+                        st.info("Approved. (Source is UMLS; no SNOMED synonym added.)")
 
-                if c1.button("Approve", key=f"approve_{i}"):
-                    append_new_phrase_to_subset(phrase, term, cid)
-                    df.loc[i, "action"] = "approved"
-                    df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
+                    df.loc[df["raw_phrase"] == phrase, "action"] = "approved"
+                    df.loc[df["raw_phrase"] == phrase, "review_time"] = datetime.now().isoformat(timespec="seconds")
                     df.to_csv(NEW_TERMS_LOG, index=False)
-                    st.success("Approved & added to SNOMED.")
                     st.rerun()
 
-                if c2.button("Reject", key=f"reject_{i}"):
-                    df.loc[i, "action"] = "rejected"
-                    df.loc[i, "review_time"] = datetime.now().isoformat(timespec='seconds')
+                if c2.button("Reject", key=f"rej_{i}"):
+                    df.loc[df["raw_phrase"] == phrase, "action"] = "rejected"
+                    df.loc[df["raw_phrase"] == phrase, "review_time"] = datetime.now().isoformat(timespec="seconds")
                     df.to_csv(NEW_TERMS_LOG, index=False)
                     st.warning("Rejected.")
                     st.rerun()
 
 
 # ============================================================
-# KNOWLEDGE GRAPH VISUALIZATION
+# KNOWLEDGE GRAPH + ANALYTICS
 # ============================================================
-st.markdown("## 📡 Knowledge Graph (SNOMED Hierarchy)")
+st.divider()
+st.header("📡 Knowledge Graph & Analytics")
 
-desc_df = pd.read_csv(f"{BASE_DIR}/descriptions_diabetes.tsv", sep="\t", dtype=str)
-rel_df = pd.read_csv(f"{BASE_DIR}/relationships_diabetes.tsv", sep="\t", dtype=str)
-
+desc_df = pd.read_csv(DESC_PATH, sep="\t", dtype=str)
+rel_df = pd.read_csv(REL_PATH, sep="\t", dtype=str)
 desc_df = desc_df[desc_df["active"] == "1"]
 rel_df = rel_df[rel_df["active"] == "1"]
 
@@ -759,58 +624,45 @@ G = nx.DiGraph()
 for cid in desc_df["conceptId"].unique():
     G.add_node(cid)
 
-isa_edges = rel_df[rel_df["typeId"] == "116680003"]
-for _, row in isa_edges.iterrows():
-    parent = row["destinationId"]
-    child = row["sourceId"]
+isa_edges = rel_df[rel_df["typeId"] == "116680003"]  # IS-A
+for _, r in isa_edges.iterrows():
+    parent = r["destinationId"]
+    child = r["sourceId"]
     if parent in G.nodes and child in G.nodes:
         G.add_edge(parent, child)
 
 new_synonyms = desc_df[desc_df["id"].str.contains("user_", na=False)]
 
-with st.expander("Show Knowledge Graph"):
+with st.expander("🧠 Show Knowledge Graph"):
     fig, ax = plt.subplots(figsize=(10, 8))
     pos = nx.spring_layout(G, seed=42)
 
     nx.draw_networkx_nodes(G, pos, node_size=120, node_color="lightblue", ax=ax)
 
+    # Highlight concepts that received new synonyms
     new_parents = new_synonyms["conceptId"].unique()
-    nx.draw_networkx_nodes(
-        G, pos,
-        nodelist=new_parents,
-        node_color="orange",
-        node_size=180,
-        ax=ax
-    )
+    nx.draw_networkx_nodes(G, pos, nodelist=new_parents, node_color="orange", node_size=200, ax=ax)
 
     nx.draw_networkx_edges(G, pos, arrows=False, alpha=0.3, ax=ax)
-    ax.set_title("Knowledge Graph\n(Orange = Concepts with New Synonyms)")
+    ax.set_title("SNOMED Diabetes Subset Graph\nOrange = Concepts with New Synonyms")
     ax.axis("off")
-
     st.pyplot(fig)
 
     st.info(f"New synonyms added: **{len(new_synonyms)}**")
+    st.info(f"Orange parent concepts count: **{len(new_parents)}**")
 
-
-# ============================================================
-# ANALYTICS DASHBOARD
-# ============================================================
-st.markdown("## 📈 Analytics")
-
-with st.expander("View Analytics"):
+with st.expander("📈 Analytics / Stats"):
     if os.path.exists(NEW_TERMS_LOG):
         log_df = pd.read_csv(NEW_TERMS_LOG)
 
-        total_added = (log_df["action"] == "added").sum()
-        total_queued = (log_df["action"] == "queued").sum()
-        total_approved = (log_df["action"] == "approved").sum()
-        total_rejected = (log_df["action"] == "rejected").sum()
+        st.write("### Log Summary")
+        st.metric("Added", int((log_df["action"] == "added").sum()))
+        st.metric("Queued", int((log_df["action"] == "queued").sum()))
+        st.metric("Approved", int((log_df["action"] == "approved").sum()))
+        st.metric("Rejected", int((log_df["action"] == "rejected").sum()))
+        st.metric("Discarded", int((log_df["action"] == "discarded").sum()))
 
-        st.metric("Auto-added Synonyms", total_added)
-        st.metric("Queued Items", total_queued)
-        st.metric("Approved Items", total_approved)
-        st.metric("Rejected Items", total_rejected)
-
+        st.write("### Activity Trend")
         if not log_df.empty:
             log_df["day"] = pd.to_datetime(log_df["timestamp"]).dt.date
             trend = log_df.groupby("day").size()
@@ -818,65 +670,71 @@ with st.expander("View Analytics"):
             fig2, ax2 = plt.subplots(figsize=(8, 4))
             ax2.plot(trend.index, trend.values)
             ax2.set_title("Daily Activity Trend")
-            ax2.set_ylabel("Actions")
             ax2.set_xlabel("Date")
+            ax2.set_ylabel("Actions")
             st.pyplot(fig2)
+
+        st.write("### Full Log Preview")
+        st.dataframe(log_df.tail(50), use_container_width=True)
     else:
-        st.info("No analytics available yet.")
+        st.info("No analytics yet.")
 
 
 # ============================================================
-# ZIP DOWNLOAD
+# DOWNLOAD LOG FILE
 # ============================================================
-st.markdown("## 📦 Download Updated SNOMED Subset")
+st.divider()
+st.header("📥 Downloads")
 
+init_new_terms_log()
+if os.path.exists(NEW_TERMS_LOG):
+    with open(NEW_TERMS_LOG, "rb") as f:
+        st.download_button("Download Log CSV", f, file_name="new_terms_log.csv")
+
+
+# ============================================================
+# ZIP DOWNLOAD OF SUBSET
+# ============================================================
 def make_zip():
     zip_path = f"{BASE_DIR}/subset_updated.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in [
-            "descriptions_diabetes.tsv",
-            "concepts_diabetes.tsv",
-            "relationships_diabetes.tsv",
-        ]:
-            z.write(f"{BASE_DIR}/{f}", arcname=f)
+        for fn in ["descriptions_diabetes.tsv", "concepts_diabetes.tsv", "relationships_diabetes.tsv"]:
+            p = f"{BASE_DIR}/{fn}"
+            if os.path.exists(p):
+                z.write(p, arcname=fn)
     return zip_path
 
-if st.button("Create ZIP"):
+
+if st.button("Create ZIP of Updated Subset"):
     zp = make_zip()
     with open(zp, "rb") as f:
-        st.download_button("Download ZIP", f, "subset_updated.zip")
+        st.download_button("Download Updated Subset ZIP", f, file_name="subset_updated.zip")
 
 
 # ============================================================
 # PUSH TO GITHUB
 # ============================================================
-st.markdown("## 🚀 Push Updated TSV to GitHub")
+st.divider()
+st.header("🚀 Push Updated TSV to GitHub")
 
-with st.expander("GitHub Sync Settings"):
+with st.expander("GitHub Push Settings"):
     repo = st.text_input("Repository (e.g., username/diabetes-matcher-ui)")
     token = st.text_input("GitHub Token", type="password")
-    file_to_push = f"{BASE_DIR}/descriptions_diabetes.tsv"
 
-    if st.button("Push to GitHub"):
+    if st.button("Push descriptions_diabetes.tsv to GitHub"):
         if not repo or not token:
             st.error("Missing repo or token.")
         else:
             api_url = f"https://api.github.com/repos/{repo}/contents/diabetes_subset_rf2/descriptions_diabetes.tsv"
 
-            with open(file_to_push, "rb") as f:
+            with open(DESC_PATH, "rb") as f:
                 content = base64.b64encode(f.read()).decode()
 
             headers = {"Authorization": f"token {token}"}
             resp = requests.get(api_url, headers=headers)
-
             sha = resp.json().get("sha") if resp.status_code == 200 else None
 
-            payload = {
-                "message": "Auto-update from Streamlit app",
-                "content": content,
-                "branch": "main",
-            }
-
+            payload = {"message": "Auto-update from Streamlit app", "content": content, "branch": "main"}
             if sha:
                 payload["sha"] = sha
 
@@ -885,4 +743,4 @@ with st.expander("GitHub Sync Settings"):
             if r.status_code in [200, 201]:
                 st.success("Pushed to GitHub successfully!")
             else:
-                st.error(f"Error: {r.text}")
+                st.error(f"GitHub Error: {r.text}")
